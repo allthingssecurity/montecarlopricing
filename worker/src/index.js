@@ -233,22 +233,111 @@ function findNearestEPS(hist, year) {
   return near;
 }
 
+// Yahoo quote + quoteSummary — try multiple endpoints to get EPS/PE
+async function fetchYahooQuote(ticker) {
+  const enc = encodeURIComponent(ticker);
+
+  // 1. Try v10 quoteSummary (no crumb needed for some regions/modules)
+  const summaryUrls = [
+    `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${enc}?modules=price,summaryDetail,defaultKeyStatistics,financialData`,
+    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${enc}?modules=price,summaryDetail,defaultKeyStatistics,financialData`,
+  ];
+  for (const url of summaryUrls) {
+    try {
+      const res = await fetch(url, { headers: { 'User-Agent': UA, Accept: 'application/json' } });
+      if (!res.ok) continue;
+      const json = await res.json();
+      const r = json?.quoteSummary?.result?.[0];
+      if (r) {
+        const p = r.price || {}, sd = r.summaryDetail || {}, ks = r.defaultKeyStatistics || {}, fd = r.financialData || {};
+        return {
+          regularMarketPrice: rawVal(p.regularMarketPrice) || rawVal(fd.currentPrice),
+          epsTrailingTwelveMonths: rawVal(ks.trailingEps) || rawVal(fd.trailingEps),
+          trailingPE: rawVal(sd.trailingPE) || rawVal(p.trailingPE),
+          forwardPE: rawVal(sd.forwardPE) || rawVal(ks.forwardPE),
+          sharesOutstanding: rawVal(ks.sharesOutstanding),
+          shortName: p.shortName || p.longName,
+          currency: p.currency,
+          exchange: p.exchangeName || p.exchange,
+          marketState: p.marketState,
+        };
+      }
+    } catch { /* next */ }
+  }
+
+  // 2. Try v6/v7 quote endpoints
+  const quoteUrls = [
+    `https://query1.finance.yahoo.com/v6/finance/quote?symbols=${enc}`,
+    `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${enc}`,
+  ];
+  for (const url of quoteUrls) {
+    try {
+      const res = await fetch(url, { headers: { 'User-Agent': UA, Accept: 'application/json' } });
+      if (!res.ok) continue;
+      const json = await res.json();
+      const results = json?.quoteResponse?.result || [];
+      if (results.length > 0) return results[0];
+    } catch { /* next */ }
+  }
+
+  // 3. Try Yahoo crumb-based approach
+  try {
+    const initRes = await fetch('https://fc.yahoo.com/', { headers: { 'User-Agent': UA }, redirect: 'manual' });
+    const setCookie = initRes.headers.getSetCookie?.() || [];
+    const cookies = setCookie.map(c => c.split(';')[0]).join('; ');
+    if (cookies) {
+      const crumbRes = await fetch('https://query2.finance.yahoo.com/v1/test/getcrumb', { headers: { 'User-Agent': UA, Cookie: cookies } });
+      if (crumbRes.ok) {
+        const crumb = (await crumbRes.text()).trim();
+        const url = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${enc}?modules=price,summaryDetail,defaultKeyStatistics,financialData&crumb=${encodeURIComponent(crumb)}`;
+        const res = await fetch(url, { headers: { 'User-Agent': UA, Cookie: cookies } });
+        if (res.ok) {
+          const json = await res.json();
+          const r = json?.quoteSummary?.result?.[0];
+          if (r) {
+            const p = r.price || {}, sd = r.summaryDetail || {}, ks = r.defaultKeyStatistics || {}, fd = r.financialData || {};
+            return {
+              regularMarketPrice: rawVal(p.regularMarketPrice) || rawVal(fd.currentPrice),
+              epsTrailingTwelveMonths: rawVal(ks.trailingEps) || rawVal(fd.trailingEps),
+              trailingPE: rawVal(sd.trailingPE) || rawVal(p.trailingPE),
+              forwardPE: rawVal(sd.forwardPE),
+              sharesOutstanding: rawVal(ks.sharesOutstanding),
+              shortName: p.shortName || p.longName,
+              currency: p.currency,
+              exchange: p.exchangeName,
+              marketState: p.marketState,
+            };
+          }
+        }
+      }
+    }
+  } catch { /* crumb approach failed */ }
+
+  return null;
+}
+
 async function fetchStockData(ticker, lookbackYears = 8) {
   const warnings = [];
-  let source = 'moneycontrol';
+  let source = 'unknown';
 
-  const mcSearch = await searchMoneycontrol(ticker);
+  // Fetch from all sources in parallel
+  const [mcSearch, chartResult, yahooQuote] = await Promise.all([
+    searchMoneycontrol(ticker),
+    fetchYahooChart(ticker, lookbackYears <= 5 ? '5y' : lookbackYears <= 10 ? '10y' : 'max', '1mo'),
+    fetchYahooQuote(ticker)
+  ]);
+
   let mcData = null;
   if (mcSearch?.sc_id) {
     const ex = ticker.endsWith('.BO') ? 'bse' : 'nse';
     mcData = await fetchMoneycontrolData(mcSearch.sc_id, ex);
   }
 
-  const range = lookbackYears <= 5 ? '5y' : lookbackYears <= 10 ? '10y' : 'max';
-  const { prices: historicalPrices, meta: chartMeta } = await fetchYahooChart(ticker, range, '1mo');
+  const { prices: historicalPrices, meta: chartMeta } = chartResult;
 
   let currentPrice, trailingEps, trailingPE, forwardPE, sharesOutstanding, companyName, currency, exchange, marketState;
 
+  // Priority 1: Moneycontrol
   if (mcData) {
     currentPrice = parseFloat(mcData.pricecurrent) || parseFloat(mcData.LP);
     trailingEps = parseFloat(mcData.SC_TTM) || parseFloat(mcData.sc_ttm_cons) || parseFloat(mcData.CEPS);
@@ -258,12 +347,29 @@ async function fetchStockData(ticker, lookbackYears = 8) {
     companyName = mcData.SC_FULLNM || mcSearch?.stock_name || ticker;
     currency = 'INR'; exchange = mcData.exchange === 'B' ? 'BSE' : 'NSE';
     marketState = mcData.market_state || ''; source = 'moneycontrol';
-  } else if (chartMeta) {
-    currentPrice = chartMeta.regularMarketPrice || chartMeta.previousClose;
-    companyName = chartMeta.shortName || chartMeta.longName || ticker;
-    currency = chartMeta.currency || 'INR'; exchange = chartMeta.exchangeName || '';
-    marketState = ''; source = 'yahoo-chart';
-    warnings.push('Limited data from Moneycontrol. Using Yahoo chart metadata.');
+  }
+
+  // Priority 2: Yahoo quote (supplements or replaces)
+  if (yahooQuote) {
+    if (!currentPrice) currentPrice = yahooQuote.regularMarketPrice || yahooQuote.previousClose;
+    if (!trailingEps || isNaN(trailingEps)) trailingEps = yahooQuote.epsTrailingTwelveMonths || yahooQuote.trailingEps;
+    if (!trailingPE || isNaN(trailingPE)) trailingPE = yahooQuote.trailingPE;
+    if (!forwardPE) forwardPE = yahooQuote.forwardPE || null;
+    if (!sharesOutstanding) sharesOutstanding = yahooQuote.sharesOutstanding || null;
+    if (!companyName || companyName === ticker) companyName = yahooQuote.shortName || yahooQuote.longName || companyName;
+    if (!currency) currency = yahooQuote.currency || 'INR';
+    if (!exchange) exchange = yahooQuote.exchange || yahooQuote.fullExchangeName || '';
+    if (!marketState) marketState = yahooQuote.marketState || '';
+    if (source === 'unknown') source = 'yahoo-quote';
+  }
+
+  // Priority 3: Yahoo chart meta
+  if (chartMeta) {
+    if (!currentPrice) currentPrice = chartMeta.regularMarketPrice || chartMeta.previousClose;
+    if (!companyName || companyName === ticker) companyName = chartMeta.shortName || chartMeta.longName || companyName;
+    if (!currency) currency = chartMeta.currency || 'INR';
+    if (!exchange) exchange = chartMeta.exchangeName || '';
+    if (source === 'unknown') { source = 'yahoo-chart'; warnings.push('Using Yahoo chart data only.'); }
   }
 
   if (!currentPrice) throw new Error('Could not determine current price from any source.');
@@ -364,6 +470,25 @@ export default {
       // Health check
       if (path === '/api/health') {
         return jsonResponse({ status: 'ok', timestamp: new Date().toISOString() }, 200, origin);
+      }
+
+      // Debug endpoint — shows raw responses from each data source
+      const debugMatch = path.match(/^\/api\/debug\/(.+)$/);
+      if (debugMatch && request.method === 'GET') {
+        const ticker = decodeURIComponent(debugMatch[1]);
+        const mcSearch = await searchMoneycontrol(ticker);
+        let mcData = null;
+        if (mcSearch?.sc_id) {
+          const ex = ticker.endsWith('.BO') ? 'bse' : 'nse';
+          mcData = await fetchMoneycontrolData(mcSearch.sc_id, ex);
+        }
+        const yq = await fetchYahooQuote(ticker);
+        const { meta } = await fetchYahooChart(ticker, '1y', '1mo');
+        return jsonResponse({
+          moneycontrol: { search: mcSearch ? { sc_id: mcSearch.sc_id, name: mcSearch.stock_name } : null, data: mcData ? { pricecurrent: mcData.pricecurrent, LP: mcData.LP, SC_TTM: mcData.SC_TTM, sc_ttm_cons: mcData.sc_ttm_cons, PE: mcData.PE, CEPS: mcData.CEPS } : null },
+          yahooQuote: yq ? { price: yq.regularMarketPrice, eps: yq.epsTrailingTwelveMonths, pe: yq.trailingPE, name: yq.shortName } : null,
+          yahooChart: meta ? { price: meta.regularMarketPrice, name: meta.shortName, currency: meta.currency } : null
+        }, 200, origin);
       }
 
       // Stock data
