@@ -183,7 +183,7 @@ export async function fetchStockData(ticker, lookbackYears = 8) {
 
   if (mcData) {
     currentPrice = parseFloat(mcData.pricecurrent) || parseFloat(mcData.LP);
-    trailingEps = parseFloat(mcData.SC_TTM) || parseFloat(mcData.sc_ttm_cons);
+    trailingEps = parseFloat(mcData.SC_TTM) || parseFloat(mcData.sc_ttm_cons) || parseFloat(mcData.CEPS);
     trailingPE = parseFloat(mcData.PE) || parseFloat(mcData.PECONS);
     forwardPE = parseFloat(mcData.PECONS) || null;
     sharesOutstanding = parseFloat(mcData.SHRS) || null;
@@ -228,7 +228,13 @@ export async function fetchStockData(ticker, lookbackYears = 8) {
     trailingPE = currentPrice / trailingEps;
   }
 
-  if (!trailingEps || trailingEps === 0) {
+  // Compute EPS from price/PE if EPS not directly available
+  if ((!trailingEps || trailingEps === 0 || isNaN(trailingEps)) && trailingPE && trailingPE > 0 && currentPrice) {
+    trailingEps = currentPrice / trailingPE;
+    warnings.push('EPS derived from Price/PE ratio. May be less precise.');
+  }
+
+  if (!trailingEps || trailingEps === 0 || isNaN(trailingEps)) {
     throw new Error('Trailing EPS not available. Please provide manual EPS input.');
   }
 
