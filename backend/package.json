@@ -1,0 +1,16 @@
+{
+  "name": "eps-pe-monte-carlo-backend",
+  "version": "1.0.0",
+  "description": "Monte Carlo EPS×P/E valuation backend",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "yahoo-finance2": "^2.13.2"
+  }
+}

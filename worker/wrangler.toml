@@ -1,0 +1,8 @@
+name = "montecarlo-api"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+# Set CLOUDFLARE_API_TOKEN env var and account_id here or via wrangler CLI
+account_id = "9bf349d02a79d19077f1cf69a1f2d321"
+
+[vars]
+ENVIRONMENT = "production"
